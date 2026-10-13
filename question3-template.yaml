@@ -1,0 +1,182 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Question 3 - Glue, Step Functions, SQS and SNS workflow
+
+Resources:
+
+  # S3 bucket that will hold the Glue script
+  GlueScriptBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'q3-glue-script-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Role assumed by AWS Glue
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: ReadGlueScript
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${GlueScriptBucket.Arn}/scripts/*'
+
+  # Glue data-processing job
+  Question3GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${AWS::StackName}-glue-job'
+      Role: !GetAtt GlueExecutionRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: '3.9'
+        ScriptLocation: !Sub 's3://${GlueScriptBucket}/scripts/glue-script.py'
+      MaxCapacity: 0.0625
+      Timeout: 5
+      MaxRetries: 0
+
+  # SQS message queue
+  Question3Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-queue'
+      VisibilityTimeout: 60
+
+  # SNS notification topic
+  Question3Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-topic'
+
+  # Role assumed by Step Functions
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+
+  # Permissions needed by the workflow
+  WorkflowExecutionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: Question3WorkflowPermissions
+      Roles:
+        - !Ref StepFunctionsExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - glue:StartJobRun
+              - glue:GetJobRun
+              - glue:GetJobRuns
+              - glue:BatchStopJobRun
+            Resource: !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${Question3GlueJob}'
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt Question3Queue.Arn
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref Question3Topic
+
+  # Five-step workflow
+  Question3StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: WorkflowExecutionPolicy
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-workflow'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionSubstitutions:
+        GlueJobName: !Ref Question3GlueJob
+        QueueUrl: !Ref Question3Queue
+        TopicArn: !Ref Question3Topic
+      DefinitionString: !Sub |
+        {
+          "Comment": "Question 3 Glue, SQS and SNS workflow",
+          "StartAt": "Start",
+          "States": {
+            "Start": {
+              "Type": "Pass",
+              "Next": "RunGlueJob"
+            },
+            "RunGlueJob": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${!GlueJobName}"
+              },
+              "Next": "SendSQSMessage"
+            },
+            "SendSQSMessage": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "${!QueueUrl}",
+                "MessageBody": "Glue processing completed successfully"
+              },
+              "Next": "PublishSNSNotification"
+            },
+            "PublishSNSNotification": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${!TopicArn}",
+                "Message": "Question 3 workflow completed successfully"
+              },
+              "Next": "Stop"
+            },
+            "Stop": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+Outputs:
+  GlueScriptBucketName:
+    Description: S3 bucket for the Glue script
+    Value: !Ref GlueScriptBucket
+
+  GlueJobName:
+    Description: Glue job name
+    Value: !Ref Question3GlueJob
+
+  QueueUrl:
+    Description: SQS queue URL
+    Value: !Ref Question3Queue
+
+  TopicArn:
+    Description: SNS topic ARN
+    Value: !Ref Question3Topic
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref Question3StateMachine
